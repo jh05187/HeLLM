@@ -1,0 +1,4 @@
+hello world
+hello jason
+hello ai
+this is my first language model
