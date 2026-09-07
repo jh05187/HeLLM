@@ -61,16 +61,62 @@ for t in range(block_size):
         f" -> target: '{decode([target.item()])}'"
     )
 
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+
+        self.key = nn.Linear(32, head_size, bias=False)
+        self.query = nn.Linear(32, head_size, bias=False)
+        self.value = nn.Linear(32, head_size, bias=False)
+
+        self.register_buffer(
+            "tril",
+            torch.tril(torch.ones(block_size, block_size))
+        )
+
+    def forward(self, x):
+        k = self.key(x)
+        q = self.query(x)
+
+        weights = q @ k.transpose(-2, -1)
+
+        weights = weights / (k.shape[-1] ** 0.5)
+
+        weights = weights.masked_fill(
+            self.tril[:x.shape[0], :x.shape[0]] == 0,
+            float("-inf")
+        )
+
+        weights = F.softmax(weights, dim=-1)
+
+        v = self.value(x)
+
+        out = weights @ v
+
+        return out
+
 class TinyLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(
-            vocab_size,
-            vocab_size
-        )
+
+        self.token_embedding_table = nn.Embedding(vocab_size, 32)
+        self.position_embedding_table = nn.Embedding(block_size, 32)
+
+        self.attention_head = Head(32)
+
+        self.lm_head = nn.Linear(32, vocab_size)
 
     def forward(self, idx, targets=None):
-        logits = self.token_embedding_table(idx)
+        token_embeddings = self.token_embedding_table(idx)
+
+        positions = torch.arange(len(idx))
+        position_embeddings = self.position_embedding_table(positions)
+
+        x = token_embeddings + position_embeddings
+
+        x = self.attention_head(x)
+
+        logits = self.lm_head(x)
 
         if targets is None:
             loss = None
@@ -78,6 +124,25 @@ class TinyLanguageModel(nn.Module):
             loss = F.cross_entropy(logits, targets)
 
         return logits, loss
+
+    def generate(self, idx, max_new_tokens):
+        for _ in range(max_new_tokens):
+            idx_context = idx[-block_size:]
+
+            logits, loss = self(idx_context)
+
+            logits = logits[-1]
+
+            probabilities = F.softmax(logits, dim=-1)
+
+            next_token = torch.multinomial(
+                probabilities,
+                num_samples=1
+            )
+
+            idx = torch.cat((idx, next_token))
+
+        retu
 
 model = TinyLanguageModel(vocab_size)
 
@@ -103,3 +168,13 @@ logits, loss = model(x, y)
 
 print("Final loss:", loss.item())
 print("Logits shape:", logits.shape)
+
+start = torch.tensor([stoi["h"]], dtype=torch.long)
+
+generated = model.generate(
+    start,
+    max_new_tokens=50
+)
+
+print("Generated text:")
+print(decode(generated.tolist()))
