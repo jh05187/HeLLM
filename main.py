@@ -357,3 +357,19 @@ print(
         generated[0].tolist()
     )
 )
+
+torch.save(
+    {
+        "model_state_dict": model.state_dict(),
+        "stoi": stoi,
+        "itos": itos,
+        "vocab_size": vocab_size,
+        "block_size": block_size,
+        "n_embd": n_embd,
+        "n_head": n_head,
+        "n_layer": n_layer
+    },
+    "tiny_model.pth"
+)
+
+print("Model saved.")
