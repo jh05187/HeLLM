@@ -1,11 +1,18 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from datasets import load_dataset
 
-with open("training_data.txt", "r") as f:
-    text = f.read()
+ds = load_dataset("roneneldan/TinyStories", split="train")
 
-print(text)
+text = "\n".join(ds["text"][:1000])
+
+#
+# with open("training_data.txt", "r") as f:
+#   text = f.read()
+#
+# print(text)
+
 
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
@@ -142,7 +149,7 @@ class TinyLanguageModel(nn.Module):
 
             idx = torch.cat((idx, next_token))
 
-        retu
+        return idx
 
 model = TinyLanguageModel(vocab_size)
 
