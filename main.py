@@ -3,22 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import load_dataset
 
+batch_size = 32
+block_size = 64
+n_embd = 64
+n_head = 4
+n_layer = 4
+learning_rate = 0.003
+max_steps = 5000
+
 ds = load_dataset("roneneldan/TinyStories", split="train")
 
 text = "\n".join(ds["text"][:1000])
 
-#
-# with open("training_data.txt", "r") as f:
-#   text = f.read()
-#
-# print(text)
-
-
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 
-print(chars)
 print("Vocabulary size:", vocab_size)
+print("Training characters:", len(text))
 
 stoi = {char: i for i, char in enumerate(chars)}
 itos = {i: char for i, char in enumerate(chars)}
@@ -29,56 +30,60 @@ def encode(s):
 def decode(numbers):
     return "".join(itos[i] for i in numbers)
 
-encoded = encode("hello")
-
-print("Encoded:", encoded)
-print("Decoded:", decode(encoded))
-
-data = torch.tensor(encode(text), dtype=torch.long)
-
-print("Full data:")
-print(data)
-print("Shape:", data.shape)
-
-block_size = 8
+data = torch.tensor(
+    encode(text),
+    dtype=torch.long
+)
 
 def get_batch():
-    start = torch.randint(
+    starts = torch.randint(
         0,
         len(data) - block_size - 1,
-        (1,)
-    ).item()
+        (batch_size,)
+    )
 
-    x = data[start:start + block_size]
-    y = data[start + 1:start + block_size + 1]
+    x = torch.stack([
+        data[start:start + block_size]
+        for start in starts
+    ])
+
+    y = torch.stack([
+        data[start + 1:start + block_size + 1]
+        for start in starts
+    ])
 
     return x, y
-
-x, y = get_batch()
-
-print("x:", x)
-print("y:", y)
-
-for t in range(block_size):
-    context = x[:t + 1]
-    target = y[t]
-
-    print(
-        f"input: '{decode(context.tolist())}'"
-        f" -> target: '{decode([target.item()])}'"
-    )
 
 class Head(nn.Module):
     def __init__(self, head_size):
         super().__init__()
 
-        self.key = nn.Linear(32, head_size, bias=False)
-        self.query = nn.Linear(32, head_size, bias=False)
-        self.value = nn.Linear(32, head_size, bias=False)
+        self.key = nn.Linear(
+            n_embd,
+            head_size,
+            bias=False
+        )
+
+        self.query = nn.Linear(
+            n_embd,
+            head_size,
+            bias=False
+        )
+
+        self.value = nn.Linear(
+            n_embd,
+            head_size,
+            bias=False
+        )
 
         self.register_buffer(
             "tril",
-            torch.tril(torch.ones(block_size, block_size))
+            torch.tril(
+                torch.ones(
+                    block_size,
+                    block_size
+                )
+            )
         )
 
     def forward(self, x):
@@ -87,14 +92,22 @@ class Head(nn.Module):
 
         weights = q @ k.transpose(-2, -1)
 
-        weights = weights / (k.shape[-1] ** 0.5)
+        weights = weights / (
+            k.shape[-1] ** 0.5
+        )
 
         weights = weights.masked_fill(
-            self.tril[:x.shape[0], :x.shape[0]] == 0,
+            self.tril[
+                :x.shape[1],
+                :x.shape[1]
+            ] == 0,
             float("-inf")
         )
 
-        weights = F.softmax(weights, dim=-1)
+        weights = F.softmax(
+            weights,
+            dim=-1
+        )
 
         v = self.value(x)
 
@@ -102,86 +115,245 @@ class Head(nn.Module):
 
         return out
 
-class TinyLanguageModel(nn.Module):
-    def __init__(self, vocab_size):
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
         super().__init__()
 
-        self.token_embedding_table = nn.Embedding(vocab_size, 32)
-        self.position_embedding_table = nn.Embedding(block_size, 32)
+        self.heads = nn.ModuleList([
+            Head(head_size)
+            for _ in range(num_heads)
+        ])
 
-        self.attention_head = Head(32)
+        self.projection = nn.Linear(
+            n_embd,
+            n_embd
+        )
 
-        self.lm_head = nn.Linear(32, vocab_size)
+    def forward(self, x):
+        out = torch.cat(
+            [
+                head(x)
+                for head in self.heads
+            ],
+            dim=-1
+        )
+
+        return self.projection(out)
+
+class FeedForward(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.net = nn.Sequential(
+            nn.Linear(
+                n_embd,
+                4 * n_embd
+            ),
+            nn.ReLU(),
+            nn.Linear(
+                4 * n_embd,
+                n_embd
+            )
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        head_size = n_embd // n_head
+
+        self.sa = MultiHeadAttention(
+            n_head,
+            head_size
+        )
+
+        self.ffwd = FeedForward()
+
+        self.ln1 = nn.LayerNorm(n_embd)
+        self.ln2 = nn.LayerNorm(n_embd)
+
+    def forward(self, x):
+        x = x + self.sa(
+            self.ln1(x)
+        )
+
+        x = x + self.ffwd(
+            self.ln2(x)
+        )
+
+        return x
+
+class TinyLanguageModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        self.token_embedding_table = nn.Embedding(
+            vocab_size,
+            n_embd
+        )
+
+        self.position_embedding_table = nn.Embedding(
+            block_size,
+            n_embd
+        )
+
+        self.blocks = nn.Sequential(
+            *[
+                Block()
+                for _ in range(n_layer)
+            ]
+        )
+
+        self.ln_f = nn.LayerNorm(n_embd)
+
+        self.lm_head = nn.Linear(
+            n_embd,
+            vocab_size
+        )
 
     def forward(self, idx, targets=None):
-        token_embeddings = self.token_embedding_table(idx)
+        token_embeddings = (
+            self.token_embedding_table(idx)
+        )
 
-        positions = torch.arange(len(idx))
-        position_embeddings = self.position_embedding_table(positions)
+        positions = torch.arange(
+            idx.shape[1],
+            device=idx.device
+        )
 
-        x = token_embeddings + position_embeddings
+        position_embeddings = (
+            self.position_embedding_table(
+                positions
+            )
+        )
 
-        x = self.attention_head(x)
+        x = (
+            token_embeddings
+            + position_embeddings
+        )
+
+        x = self.blocks(x)
+        x = self.ln_f(x)
 
         logits = self.lm_head(x)
 
         if targets is None:
             loss = None
+
         else:
-            loss = F.cross_entropy(logits, targets)
+            B, T, C = logits.shape
+
+            logits_for_loss = logits.reshape(
+                B * T,
+                C
+            )
+
+            targets_for_loss = targets.reshape(
+                B * T
+            )
+
+            loss = F.cross_entropy(
+                logits_for_loss,
+                targets_for_loss
+            )
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens):
+    def generate(
+        self,
+        idx,
+        max_new_tokens
+    ):
         for _ in range(max_new_tokens):
-            idx_context = idx[-block_size:]
 
-            logits, loss = self(idx_context)
+            idx_context = idx[
+                :,
+                -block_size:
+            ]
 
-            logits = logits[-1]
+            logits, loss = self(
+                idx_context
+            )
 
-            probabilities = F.softmax(logits, dim=-1)
+            logits = logits[
+                :,
+                -1,
+                :
+            ]
+
+            probabilities = F.softmax(
+                logits,
+                dim=-1
+            )
 
             next_token = torch.multinomial(
                 probabilities,
                 num_samples=1
             )
 
-            idx = torch.cat((idx, next_token))
+            idx = torch.cat(
+                (
+                    idx,
+                    next_token
+                ),
+                dim=1
+            )
 
         return idx
 
-model = TinyLanguageModel(vocab_size)
+model = TinyLanguageModel()
+
+parameter_count = sum(
+    p.numel()
+    for p in model.parameters()
+)
+
+print(
+    "Parameters:",
+    f"{parameter_count:,}"
+)
 
 optimizer = torch.optim.AdamW(
     model.parameters(),
-    lr=0.01
+    lr=learning_rate
 )
 
-for step in range(1000):
+for step in range(max_steps):
     x, y = get_batch()
 
-    logits, loss = model(x, y)
+    logits, loss = model(
+        x,
+        y
+    )
 
     optimizer.zero_grad()
     loss.backward()
     optimizer.step()
 
     if step % 100 == 0:
-        print("Step:", step, "Loss:", loss.item())
+        print(
+            "Step:",
+            step,
+            "Loss:",
+            loss.item()
+        )
 
-x, y = get_batch()
-logits, loss = model(x, y)
-
-print("Final loss:", loss.item())
-print("Logits shape:", logits.shape)
-
-start = torch.tensor([stoi["h"]], dtype=torch.long)
+start = torch.tensor(
+    [[stoi["h"]]],
+    dtype=torch.long
+)
 
 generated = model.generate(
     start,
-    max_new_tokens=50
+    max_new_tokens=300
 )
 
-print("Generated text:")
-print(decode(generated.tolist()))
+print("\nGenerated text:")
+print(
+    decode(
+        generated[0].tolist()
+    )
+)
