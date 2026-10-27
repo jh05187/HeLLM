@@ -1,206 +1,83 @@
+import argparse
+import sys
+
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 
-checkpoint = torch.load(
-    "tiny_model.pth",
-    map_location="cpu",
-    weights_only=False
-)
+from checkpoint import load_checkpoint
+from data import pick_device
 
-stoi = checkpoint["stoi"]
-itos = checkpoint["itos"]
-vocab_size = checkpoint["vocab_size"]
-block_size = checkpoint["block_size"]
-n_embd = checkpoint["n_embd"]
-n_head = checkpoint["n_head"]
-n_layer = checkpoint["n_layer"]
 
-def encode(s):
-    return [stoi[c] for c in s]
+def parse_args(argv=None):
+    p = argparse.ArgumentParser(description="Generate text with a trained HeLLM checkpoint.")
+    p.add_argument("prompt", nargs="?", help="prompt text; asks interactively if left out")
+    p.add_argument("--checkpoint", default="checkpoints/best.pt")
+    p.add_argument("--max-new-tokens", type=int, default=300)
+    p.add_argument("--temperature", type=float, default=0.8, help="0 always picks the most likely token")
+    p.add_argument("--top-k", type=int, default=50, help="0 turns it off")
+    p.add_argument("--top-p", type=float, default=None, help="nucleus sampling, e.g. 0.9")
+    p.add_argument("--no-cache", action="store_true", help="recompute every position at each step")
+    p.add_argument("--device", default="auto")
+    p.add_argument("--seed", type=int, default=None)
+    return p.parse_args(argv)
 
-def decode(numbers):
-    return "".join(itos[i] for i in numbers)
 
-class Head(nn.Module):
-    def __init__(self, head_size):
-        super().__init__()
+def generate(model, tokenizer, prompt, args, device):
+    unknown = tokenizer.unknown_chars(prompt)
+    if unknown:
+        print(f"(skipping characters the model never saw: {''.join(unknown)!r})", file=sys.stderr)
+    ids = tokenizer.encode(prompt)
+    if not ids:
+        print("The prompt has no characters the model knows.", file=sys.stderr)
+        return
 
-        self.key = nn.Linear(n_embd, head_size, bias=False)
-        self.query = nn.Linear(n_embd, head_size, bias=False)
-        self.value = nn.Linear(n_embd, head_size, bias=False)
-
-        self.register_buffer(
-            "tril",
-            torch.tril(torch.ones(block_size, block_size))
-        )
-
-    def forward(self, x):
-        k = self.key(x)
-        q = self.query(x)
-
-        weights = q @ k.transpose(-2, -1)
-        weights = weights / (k.shape[-1] ** 0.5)
-
-        weights = weights.masked_fill(
-            self.tril[:x.shape[1], :x.shape[1]] == 0,
-            float("-inf")
-        )
-
-        weights = F.softmax(weights, dim=-1)
-
-        v = self.value(x)
-
-        return weights @ v
-
-class MultiHeadAttention(nn.Module):
-    def __init__(self, num_heads, head_size):
-        super().__init__()
-
-        self.heads = nn.ModuleList([
-            Head(head_size)
-            for _ in range(num_heads)
-        ])
-
-        self.projection = nn.Linear(n_embd, n_embd)
-
-    def forward(self, x):
-        out = torch.cat(
-            [head(x) for head in self.heads],
-            dim=-1
-        )
-
-        return self.projection(out)
-
-class FeedForward(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.net = nn.Sequential(
-            nn.Linear(n_embd, 4 * n_embd),
-            nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd)
-        )
-
-    def forward(self, x):
-        return self.net(x)
-
-class Block(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        head_size = n_embd // n_head
-
-        self.sa = MultiHeadAttention(
-            n_head,
-            head_size
-        )
-
-        self.ffwd = FeedForward()
-
-        self.ln1 = nn.LayerNorm(n_embd)
-        self.ln2 = nn.LayerNorm(n_embd)
-
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
-        x = x + self.ffwd(self.ln2(x))
-
-        return x
-
-class TinyLanguageModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        self.token_embedding_table = nn.Embedding(
-            vocab_size,
-            n_embd
-        )
-
-        self.position_embedding_table = nn.Embedding(
-            block_size,
-            n_embd
-        )
-
-        self.blocks = nn.Sequential(
-            *[
-                Block()
-                for _ in range(n_layer)
-            ]
-        )
-
-        self.ln_f = nn.LayerNorm(n_embd)
-
-        self.lm_head = nn.Linear(
-            n_embd,
-            vocab_size
-        )
-
-    def forward(self, idx):
-        token_embeddings = self.token_embedding_table(idx)
-
-        positions = torch.arange(
-            idx.shape[1],
-            device=idx.device
-        )
-
-        position_embeddings = self.position_embedding_table(
-            positions
-        )
-
-        x = token_embeddings + position_embeddings
-
-        x = self.blocks(x)
-        x = self.ln_f(x)
-
-        return self.lm_head(x)
-
-    def generate(self, idx, max_new_tokens):
-        for _ in range(max_new_tokens):
-            idx_context = idx[:, -block_size:]
-
-            logits = self(idx_context)
-
-            logits = logits[:, -1, :]
-
-            probabilities = F.softmax(
-                logits,
-                dim=-1
-            )
-
-            next_token = torch.multinomial(
-                probabilities,
-                num_samples=1
-            )
-
-            idx = torch.cat(
-                (idx, next_token),
-                dim=1
-            )
-
-        return idx
-
-model = TinyLanguageModel()
-
-model.load_state_dict(
-    checkpoint["model_state_dict"]
-)
-
-model.eval()
-
-prompt = input("Enter a prompt: ")
-
-encoded_prompt = encode(prompt)
-
-start = torch.tensor(
-    [encoded_prompt],
-    dtype=torch.long
-)
-
-with torch.no_grad():
-    generated = model.generate(
-        start,
-        max_new_tokens=300
+    idx = torch.tensor([ids], dtype=torch.long, device=device)
+    stream = model.generate_stream(
+        idx,
+        args.max_new_tokens,
+        temperature=args.temperature,
+        top_k=args.top_k or None,
+        top_p=args.top_p,
+        use_cache=not args.no_cache,
     )
 
-print()
-print(decode(generated[0].tolist()))
+    print(prompt, end="", flush=True)
+    new_ids = []
+    printed = 0
+    for token in stream:
+        new_ids.append(token.item())
+        text = tokenizer.decode(new_ids)
+        # A BPE token can end partway through a multi-byte character; wait for the rest of it.
+        safe = text.rstrip("�")
+        print(safe[printed:], end="", flush=True)
+        printed = len(safe)
+    print(tokenizer.decode(new_ids)[printed:])
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.seed is not None:
+        torch.manual_seed(args.seed)
+    device = pick_device(args.device)
+    model, tokenizer, checkpoint = load_checkpoint(args.checkpoint, device)
+    print(
+        f"Loaded {args.checkpoint} (step {checkpoint.get('step')}, "
+        f"val loss {checkpoint.get('val_loss', float('nan')):.4f}, {model.num_parameters():,} parameters)",
+        file=sys.stderr,
+    )
+
+    if args.prompt is not None:
+        generate(model, tokenizer, args.prompt, args, device)
+        return
+
+    while True:
+        try:
+            prompt = input("\nEnter a prompt (empty to quit): ")
+        except EOFError:
+            break
+        if not prompt:
+            break
+        generate(model, tokenizer, prompt, args, device)
+
+
+if __name__ == "__main__":
+    main()
